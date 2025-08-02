@@ -1,1 +1,26 @@
-[]
+{
+  "feedback": [
+    {
+      "id": 1754148499428,
+      "name": "aryan",
+      "email": "aryan@gmail.com",
+      "message": "Hi",
+      "rating": 5,
+      "timestamp": "2025-08-02T15:28:19.428Z"
+    },
+    {
+      "id": "1754150756697",
+      "name": "Mark",
+      "email": "mark@gmail.com",
+      "message": "Hi I am Mark",
+      "rating": 3,
+      "timestamp": "2025-08-02T16:05:56.697Z",
+      "ipAddress": "::1"
+    }
+  ],
+  "metadata": {
+    "lastModified": "2025-08-02T16:05:56.697Z",
+    "version": "1.0",
+    "count": 2
+  }
+}

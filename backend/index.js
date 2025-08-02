@@ -5,101 +5,272 @@ const path = require("path");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 require("dotenv").config();
 
-// Initialize Gemini AI
-console.log("Initializing Gemini AI...");
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY, {
-  apiVersion: "v1beta", // or "v1beta" depending on what works
-});
-console.log("Gemini initialized:", genAI ? "Success" : "Failed");
+// Initialize Gemini AI with better error handling
+let genAI = null;
+try {
+  if (process.env.GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    console.log("Gemini initialized successfully");
+  } else {
+    console.warn(
+      "⚠️ GEMINI_API_KEY not found - AI features will use fallback responses"
+    );
+  }
+} catch (error) {
+  console.error("Failed to initialize Gemini AI:", error.message);
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const FEEDBACK_FILE = path.join(__dirname, "feedback.json");
 
-// Middleware
+// Enhanced CORS configuration
 app.use(
   cors({
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST", "DELETE"],
-    allowedHeaders: ["Content-Type"],
+    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    methods: ["GET", "POST", "DELETE", "PUT"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
-app.use(express.json());
 
-// Initialize feedback file if it doesn't exist
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.path}`);
+  next();
+});
+
+// Initialize feedback file with better structure
 async function initializeFeedbackFile() {
   try {
     await fs.access(FEEDBACK_FILE);
   } catch (error) {
-    await fs.writeFile(FEEDBACK_FILE, JSON.stringify([]));
+    const initialData = {
+      feedback: [],
+      metadata: {
+        created: new Date().toISOString(),
+        lastModified: new Date().toISOString(),
+        version: "1.0",
+      },
+    };
+    await fs.writeFile(FEEDBACK_FILE, JSON.stringify(initialData, null, 2));
   }
 }
 
-// Helper function to read feedback
+// Enhanced feedback reading with validation
 async function readFeedback() {
   try {
     const data = await fs.readFile(FEEDBACK_FILE, "utf8");
-    return JSON.parse(data);
+    const parsed = JSON.parse(data);
+
+    // Handle both old and new format
+    if (Array.isArray(parsed)) {
+      // Old format - migrate to new structure
+      const newFormat = {
+        feedback: parsed,
+        metadata: {
+          created: new Date().toISOString(),
+          lastModified: new Date().toISOString(),
+          version: "1.0",
+        },
+      };
+      await writeFeedback(newFormat.feedback);
+      return newFormat.feedback;
+    }
+
+    return parsed.feedback || [];
   } catch (error) {
+    console.error("Failed to read feedback:", error.message);
     return [];
   }
 }
 
-// Helper function to write feedback
+// Enhanced feedback writing with metadata
 async function writeFeedback(feedback) {
-  await fs.writeFile(FEEDBACK_FILE, JSON.stringify(feedback, null, 2));
+  const data = {
+    feedback,
+    metadata: {
+      lastModified: new Date().toISOString(),
+      version: "1.0",
+      count: feedback.length,
+    },
+  };
+  await fs.writeFile(FEEDBACK_FILE, JSON.stringify(data, null, 2));
+}
+
+// Input validation middleware
+function validateFeedbackInput(req, res, next) {
+  const { name, message, rating } = req.body;
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({
+      error: "Name is required and cannot be empty",
+      field: "name",
+    });
+  }
+
+  if (!message || !message.trim()) {
+    return res.status(400).json({
+      error: "Message is required and cannot be empty",
+      field: "message",
+    });
+  }
+
+  if (name.trim().length > 100) {
+    return res.status(400).json({
+      error: "Name must be less than 100 characters",
+      field: "name",
+    });
+  }
+
+  if (message.trim().length > 1000) {
+    return res.status(400).json({
+      error: "Message must be less than 1000 characters",
+      field: "message",
+    });
+  }
+
+  if (rating && (isNaN(rating) || rating < 1 || rating > 5)) {
+    return res.status(400).json({
+      error: "Rating must be between 1 and 5",
+      field: "rating",
+    });
+  }
+
+  next();
 }
 
 // Routes
 
-// Get all feedback
+// Get all feedback with pagination and filtering
 app.get("/api/feedback", async (req, res) => {
   try {
     const feedback = await readFeedback();
-    res.json(feedback);
+    const { page = 1, limit = 10, rating, search } = req.query;
+
+    let filteredFeedback = [...feedback];
+
+    // Filter by rating if specified
+    if (rating) {
+      filteredFeedback = filteredFeedback.filter(
+        (item) => item.rating === parseInt(rating)
+      );
+    }
+
+    // Search in name and message if specified
+    if (search) {
+      const searchLower = search.toLowerCase();
+      filteredFeedback = filteredFeedback.filter(
+        (item) =>
+          item.name.toLowerCase().includes(searchLower) ||
+          item.message.toLowerCase().includes(searchLower)
+      );
+    }
+
+    // Sort by timestamp (newest first)
+    filteredFeedback.sort(
+      (a, b) => new Date(b.timestamp) - new Date(a.timestamp)
+    );
+
+    // Pagination
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + parseInt(limit);
+    const paginatedFeedback = filteredFeedback.slice(startIndex, endIndex);
+
+    res.json({
+      feedback: paginatedFeedback,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(filteredFeedback.length / limit),
+        totalItems: filteredFeedback.length,
+        itemsPerPage: parseInt(limit),
+      },
+    });
   } catch (error) {
-    res.status(500).json({ error: "Failed to fetch feedback" });
+    console.error("Error fetching feedback:", error);
+    res.status(500).json({
+      error: "Failed to fetch feedback",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 });
 
-// Add new feedback
-app.post("/api/feedback", async (req, res) => {
+// Add new feedback with enhanced validation
+app.post("/api/feedback", validateFeedbackInput, async (req, res) => {
   try {
-    console.log("Received feedback request:", req.body);
     const { name, email, message, rating } = req.body;
-
-    if (!name || !message) {
-      console.log("Validation failed - missing name or message");
-      return res.status(400).json({ error: "Name and message are required" });
-    }
 
     const feedback = await readFeedback();
     const newFeedback = {
-      id: Date.now(),
+      id: Date.now().toString(),
       name: name.trim(),
       email: (email || "").trim(),
       message: message.trim(),
       rating: parseInt(rating) || 5,
       timestamp: new Date().toISOString(),
+      ipAddress: req.ip || "unknown",
     };
 
     feedback.push(newFeedback);
     await writeFeedback(feedback);
 
-    console.log("Feedback added successfully:", newFeedback);
-    res.status(201).json(newFeedback);
+    res.status(201).json({
+      message: "Feedback submitted successfully",
+      feedback: newFeedback,
+    });
   } catch (error) {
     console.error("Error adding feedback:", error);
-    res
-      .status(500)
-      .json({ error: "Failed to add feedback", details: error.message });
+    res.status(500).json({
+      error: "Failed to add feedback",
+      details:
+        process.env.NODE_ENV === "development" ? error.message : undefined,
+    });
   }
 });
 
-// Delete feedback
+// Update existing feedback
+app.put("/api/feedback/:id", validateFeedbackInput, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { name, email, message, rating } = req.body;
+
+    const feedback = await readFeedback();
+    const feedbackIndex = feedback.findIndex((item) => item.id === id);
+
+    if (feedbackIndex === -1) {
+      return res.status(404).json({ error: "Feedback not found" });
+    }
+
+    // Update the feedback
+    feedback[feedbackIndex] = {
+      ...feedback[feedbackIndex],
+      name: name.trim(),
+      email: (email || "").trim(),
+      message: message.trim(),
+      rating: parseInt(rating) || feedback[feedbackIndex].rating,
+      lastModified: new Date().toISOString(),
+    };
+
+    await writeFeedback(feedback);
+
+    res.json({
+      message: "Feedback updated successfully",
+      feedback: feedback[feedbackIndex],
+    });
+  } catch (error) {
+    console.error("Error updating feedback:", error);
+    res.status(500).json({ error: "Failed to update feedback" });
+  }
+});
+
+// Delete feedback with better error handling
 app.delete("/api/feedback/:id", async (req, res) => {
   try {
-    const id = parseInt(req.params.id);
+    const id = req.params.id;
     const feedback = await readFeedback();
     const filteredFeedback = feedback.filter((item) => item.id !== id);
 
@@ -108,52 +279,59 @@ app.delete("/api/feedback/:id", async (req, res) => {
     }
 
     await writeFeedback(filteredFeedback);
-    res.json({ message: "Feedback deleted successfully" });
+    res.json({
+      message: "Feedback deleted successfully",
+      deletedId: id,
+      remainingCount: filteredFeedback.length,
+    });
   } catch (error) {
+    console.error("Error deleting feedback:", error);
     res.status(500).json({ error: "Failed to delete feedback" });
   }
 });
 
-// AI Q&A endpoint with Gemini integration
+// Enhanced AI Q&A endpoint with better model handling
 app.post("/api/ask", async (req, res) => {
   try {
     const { question } = req.body;
 
-    if (!question) {
+    if (!question || !question.trim()) {
       return res.status(400).json({ error: "Question is required" });
     }
 
-    console.log("Received question:", question);
-
-    // Immediate fallback if no API key
-    if (!process.env.GEMINI_API_KEY) {
-      console.log("No Gemini API key found, using local response");
+    // Immediate fallback if no Gemini instance
+    if (!genAI) {
       const localAnswer = await getLocalResponse(question);
       return res.json({ answer: localAnswer, source: "local" });
     }
 
-    // Use the correct model name - try these in order:
+    // Enhanced model selection with more options
     const modelNames = [
-      "gemini-1.5-pro-latest", // Most recent model
-      "gemini-pro", // Previous stable version
-      "models/gemini-pro", // Full path format
+      "gemini-1.5-pro",
+      "gemini-1.5-flash",
+      "gemini-pro",
+      "models/gemini-pro",
     ];
 
     let lastError = null;
 
-    // Try each model name until one works
     for (const modelName of modelNames) {
       try {
         const model = genAI.getGenerativeModel({ model: modelName });
-        const prompt = `The user asked: "${question}"
-        
-        Please provide a helpful, concise answer (max 150 words). 
-        If the question is about feedback systems or this application, 
-        focus on helpful information. Otherwise, provide a general helpful response.
 
-        Use a friendly tone and emojis where appropriate.`;
+        const prompt = `You are a helpful AI assistant for a feedback management application. 
 
-        console.log(`Trying model ${modelName} with prompt:`, prompt);
+User question: "${question}"
+
+Guidelines:
+- Provide helpful, concise answers (max 150 words)
+- Use a friendly, professional tone
+- Include relevant emojis where appropriate
+- If the question is about feedback systems, focus on practical advice
+- For general questions, provide informative responses
+- Be encouraging and supportive
+
+Please respond helpfully:`;
 
         const result = await model.generateContent(prompt);
         const response = await result.response;
@@ -163,79 +341,181 @@ app.post("/api/ask", async (req, res) => {
         }
 
         const answer = response.text();
-        console.log("Gemini response:", answer);
 
-        return res.json({ answer, source: "gemini", model: modelName });
+        return res.json({
+          answer,
+          source: "gemini",
+          model: modelName,
+          timestamp: new Date().toISOString(),
+        });
       } catch (modelError) {
-        console.error(`Failed with model ${modelName}:`, modelError);
+        console.error(`Model ${modelName} failed:`, modelError.message);
         lastError = modelError;
-        continue; // Try next model
+        continue;
       }
     }
 
-    // If all models failed
+    // If all models failed, use fallback
     throw lastError || new Error("All model attempts failed");
   } catch (error) {
-    console.error("AI endpoint error:", error);
-
-    // Fallback to local response
+    console.error("Error in AI endpoint:", error);
+    // Enhanced fallback response
     const localAnswer = await getLocalResponse(req.body?.question || "Help");
     res.json({
       answer: localAnswer,
       source: "local-fallback",
-      error: error.message,
-      note: "Gemini AI failed, using local response",
+      note: "AI service temporarily unavailable, using local response",
+      timestamp: new Date().toISOString(),
     });
   }
 });
 
-// Local response function (fallback)
+// Enhanced local response function with more comprehensive answers
 async function getLocalResponse(question) {
   const lowerQuestion = question.toLowerCase().trim();
 
-  if (
-    lowerQuestion.includes("hello") ||
-    lowerQuestion.includes("hi") ||
-    lowerQuestion.includes("hey")
-  ) {
-    return "Hello! 👋 I'm here to help you with the Feedback Tracker app. You can ask me about features, how to use the app, or any general questions!";
+  const responses = {
+    greeting: () =>
+      "Hello! 👋 I'm your feedback management assistant. I can help you understand how to use this app, explain features, or answer general questions!",
+
+    whatIsThis: () =>
+      "This is a **Feedback Tracker Application**! 📝\n\n**Key Features:**\n• Submit feedback with star ratings (1-5 ⭐)\n• View and manage all feedback entries\n• Search and filter feedback\n• Delete unwanted entries\n• AI-powered Q&A assistance\n• Real-time updates without page refresh",
+
+    howToAdd: () =>
+      "**To submit feedback:** ✨\n1. Navigate to the 'Feedback Management' section\n2. Fill in your name (required)\n3. Write your message (required)\n4. Add email (optional)\n5. Select rating (1-5 stars)\n6. Click 'Submit Feedback'\n\nYour feedback will appear instantly in the list!",
+
+    howToDelete: () =>
+      "**To delete feedback:** 🗑️\n1. Find the feedback item in the list\n2. Click the trash icon (🗑️) next to it\n3. Confirm deletion in the popup\n\n*Note: Deletion is permanent and cannot be undone.*",
+
+    features: () =>
+      "**App Features:** 🚀\n\n🔹 **Feedback Management**: Add, edit, view, delete\n🔹 **Star Ratings**: 1-5 star rating system\n🔹 **Search & Filter**: Find specific feedback\n🔹 **Responsive Design**: Works on all devices\n🔹 **Data Persistence**: Feedback saved permanently\n🔹 **AI Assistant**: Get help anytime (that's me!)\n🔹 **Real-time Updates**: No page refresh needed",
+
+    general: (q) =>
+      `I understand you're asking about "${q}". I'm here to help with the feedback tracker app! 🤔\n\n**Try asking about:**\n• How to use features\n• App capabilities\n• Technical questions\n• General assistance\n\nWhat would you like to know?`,
+  };
+
+  // Enhanced pattern matching
+  if (/\b(hello|hi|hey|greetings)\b/i.test(lowerQuestion)) {
+    return responses.greeting();
   } else if (
-    lowerQuestion.includes("what is this") ||
-    lowerQuestion.includes("what does this do")
+    /\b(what is|what does|about this|describe)\b/i.test(lowerQuestion)
   ) {
-    return "This is a Feedback Tracker application! 📝 It allows users to:\n• Submit feedback with ratings (1-5 stars)\n• View all submitted feedback in an organized list\n• Delete feedback when needed\n• Ask questions to this AI assistant (that's me!)";
+    return responses.whatIsThis();
   } else if (
-    lowerQuestion.includes("how to add") ||
-    lowerQuestion.includes("submit feedback") ||
-    lowerQuestion.includes("add feedback")
+    /\b(how to add|submit|add feedback|create)\b/i.test(lowerQuestion)
   ) {
-    return 'To add feedback:\n1. Go to the "Feedback Management" tab\n2. Fill in your name (required) and message (required)\n3. Optionally add your email\n4. Choose a star rating (1-5 stars)\n5. Click "Submit Feedback"\n\nThe feedback will appear in the list on the right side! ✨';
+    return responses.howToAdd();
+  } else if (/\b(delete|remove|trash)\b/i.test(lowerQuestion)) {
+    return responses.howToDelete();
   } else if (
-    lowerQuestion.includes("delete") ||
-    lowerQuestion.includes("remove")
+    /\b(features|capabilities|what can|functions)\b/i.test(lowerQuestion)
   ) {
-    return "To delete feedback:\n1. Look for the 🗑️ trash icon next to any feedback item\n2. Click on it\n3. Confirm the deletion in the popup\n\nThe feedback will be permanently removed from the list.";
-  } else if (
-    lowerQuestion.includes("feature") ||
-    lowerQuestion.includes("what can")
-  ) {
-    return "Key features of this app:\n🔹 **Feedback Management**: Add, view, and delete user feedback\n🔹 **Star Ratings**: 5-star rating system for feedback\n🔹 **Responsive Design**: Works on desktop and mobile\n🔹 **Real-time Updates**: No page refresh needed\n🔹 **AI Assistant**: Ask questions (that's me!)\n🔹 **Data Persistence**: Feedback is saved between sessions";
+    return responses.features();
   } else {
-    return `I understand you're asking about "${question}". This is a feedback tracking application with AI assistance. Try asking about app features, how to use it, or any general questions! 🤔`;
+    return responses.general(question);
   }
 }
 
-// Health check
+// Get app statistics
+app.get("/api/stats", async (req, res) => {
+  try {
+    const feedback = await readFeedback();
+
+    const stats = {
+      totalFeedback: feedback.length,
+      averageRating:
+        feedback.length > 0
+          ? (
+              feedback.reduce((sum, item) => sum + item.rating, 0) /
+              feedback.length
+            ).toFixed(1)
+          : 0,
+      ratingDistribution: {
+        1: feedback.filter((item) => item.rating === 1).length,
+        2: feedback.filter((item) => item.rating === 2).length,
+        3: feedback.filter((item) => item.rating === 3).length,
+        4: feedback.filter((item) => item.rating === 4).length,
+        5: feedback.filter((item) => item.rating === 5).length,
+      },
+      recentFeedbackCount: feedback.filter((item) => {
+        const feedbackDate = new Date(item.timestamp);
+        const weekAgo = new Date();
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        return feedbackDate > weekAgo;
+      }).length,
+    };
+
+    res.json(stats);
+  } catch (error) {
+    console.error("Error fetching stats:", error);
+    res.status(500).json({ error: "Failed to fetch statistics" });
+  }
+});
+
+// Health check with more detailed information
 app.get("/api/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
+  res.json({
+    status: "OK",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: process.env.NODE_ENV || "development",
+    geminiAvailable: !!genAI,
+  });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error("Unhandled error:", error);
+
+  // Check if response was already sent
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(500).json({
+    error: "Internal server error",
+    details: process.env.NODE_ENV === "development" ? error.message : undefined,
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  // Check if response was already sent
+  if (res.headersSent) {
+    return;
+  }
+
+  res.status(404).json({
+    error: "Endpoint not found",
+    path: req.path,
+    method: req.method,
+  });
+});
+
+// Graceful shutdown handling
+process.on("SIGINT", () => {
+  console.log("Received SIGINT, shutting down gracefully");
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log("Received SIGTERM, shutting down gracefully");
+  process.exit(0);
 });
 
 // Start server
 async function startServer() {
-  await initializeFeedbackFile();
-  app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  try {
+    await initializeFeedbackFile();
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+      console.log(`📊 Feedback file: ${FEEDBACK_FILE}`);
+      console.log(`🤖 Gemini AI: ${genAI ? "Available" : "Unavailable"}`);
+    });
+  } catch (error) {
+    console.error("Failed to initialize server:", error.message);
+    process.exit(1);
+  }
 }
 
 startServer();

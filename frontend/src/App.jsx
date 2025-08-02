@@ -26,7 +26,7 @@ function App() {
   const fetchFeedback = async () => {
     try {
       const response = await axios.get(`${API_BASE}/feedback`);
-      setFeedback(response.data);
+      setFeedback(response.data.feedback);
       console.log("Feedback fetched successfully:", response.data);
     } catch (error) {
       console.error("Error fetching feedback:", error);
